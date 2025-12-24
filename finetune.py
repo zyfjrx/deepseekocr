@@ -1,27 +1,21 @@
 import os
 import math
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from transformers import (
     AutoTokenizer,
-    AutoModelForCausalLM,
     Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling
+    TrainingArguments
 )
 from peft import LoraConfig, get_peft_model, TaskType
 from PIL import Image, ImageOps
-from typing import List, Dict, Any, Tuple, Optional
-import numpy as np
 
 # 导入本地模型代码
 # 确保 modeling_deepseekocr.py 在同一目录下
-from modeling_deepseekocr import (
+from models.modeling_deepseekocr import (
     DeepseekOCRForCausalLM,
-    DeepseekOCRConfig,
     dynamic_preprocess,
-    BasicImageTransform,
-    text_encode
+    BasicImageTransform
 )
 
 # ==========================================
@@ -72,6 +66,7 @@ class DeepSeekOCRDataset(Dataset):
             print(f"Error loading image {image_path}: {e}")
             # 返回一个 dummy 数据或者抛出异常
             return self.__getitem__((idx + 1) % len(self))
+        # /Users/zhangyf/PycharmProjects/cfel/deepseekocr/data/images/00009_hr-0.png
 
         # 动态分辨率预处理
         # 逻辑复用自 modeling_deepseekocr.py 的 infer 方法
@@ -118,27 +113,27 @@ class DeepSeekOCRDataset(Dataset):
         # 拼接文本
         # 格式: <bos> User: <image_placeholder> \n Prompt \n Assistant: Response <eos>
         # 这里简化处理，你可以根据需要调整 Chat Template
-        
+
         user_prefix_ids = self.tokenizer.encode("<|User|>", add_special_tokens=False)
         assistant_prefix_ids = self.tokenizer.encode("<|Assistant|>", add_special_tokens=False)
         prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
         response_ids = self.tokenizer.encode(response_text, add_special_tokens=False) + [self.tokenizer.eos_token_id]
-        
+
         # 组合 Input IDs
         # [User] [Image_Tokens] [Prompt] [Assistant] [Response]
         input_ids = (
-            [self.tokenizer.bos_token_id] + 
-            user_prefix_ids + 
-            tokenized_image + 
-            prompt_ids + 
-            assistant_prefix_ids + 
+            [self.tokenizer.bos_token_id] +
+            user_prefix_ids +
+            tokenized_image +
+            prompt_ids +
+            assistant_prefix_ids +
             response_ids
         )
-        
+
         # 组合 Labels (User 部分设为 -100)
         context_len = 1 + len(user_prefix_ids) + len(tokenized_image) + len(prompt_ids) + len(assistant_prefix_ids)
         labels = [IGNORE_INDEX] * context_len + response_ids
-        
+
         # 组合 Images Seq Mask (Image Token 位置为 True)
         # Mask 长度必须与 input_ids 一致
         seq_mask = [False] * (1 + len(user_prefix_ids)) + \

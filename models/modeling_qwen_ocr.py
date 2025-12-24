@@ -1,27 +1,20 @@
-from modeling_deepseekv2 import DeepseekV2Model, DeepseekV2ForCausalLM
-from configuration_deepseek_v2 import DeepseekV2Config
-from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers import Qwen2ForCausalLM, Qwen2Config, Qwen2Model
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import List, Optional, Tuple, Union
-from transformers.cache_utils import Cache
-import requests
-from PIL import Image, ImageOps, ImageDraw, ImageFont
-from io import BytesIO
 import torch
 import torch.nn as nn
-from torch.nn import CrossEntropyLoss
-from torchvision import transforms
-from torchvision.transforms.functional import InterpolationMode
 import os
-from deepencoder import build_sam_vit_b, build_clip_l, MlpProjector
+from models.deepencoder import build_sam_vit_b, build_clip_l, MlpProjector
 from addict import Dict
+from PIL import Image, ImageOps, ImageDraw, ImageFont
+from torchvision import transforms
 from transformers import TextStreamer
-from conversation import get_conv_template
+from models.conversation import get_conv_template
 from abc import ABC
 import math
 import re
 from tqdm import tqdm
 import numpy as np
-import time
 
 
 def load_image(image_path):
@@ -149,9 +142,6 @@ def process_image_with_refs(image, ref_texts, output_path):
     return result_image
 
 
-
-
-
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
     best_ratio_diff = float('inf')
     best_ratio = (1, 1)
@@ -210,7 +200,6 @@ def dynamic_preprocess(image, min_num=2, max_num=9, image_size=640, use_thumbnai
     return processed_images, target_aspect_ratio
 
 
-
 def normalize_transform(mean, std):
     if mean is None and std is None:
         transform = None
@@ -224,7 +213,6 @@ def normalize_transform(mean, std):
         transform = transforms.Normalize(mean=mean, std=std)
 
     return transform
-
 
 
 def format_messages(
@@ -348,245 +336,271 @@ class NoEOSTextStreamer(TextStreamer):
         print(text, flush=True, end="")
 
 
-class DeepseekOCRConfig(DeepseekV2Config):
-    model_type = "DeepseekOCR"
 
-class DeepseekOCRModel(DeepseekV2Model):
-    config_class = DeepseekOCRConfig
+class QwenOCRConfig(Qwen2Config):
+    model_type = "qwen_ocr"
+    deepseek_ocr_checkpoint = "/Users/zhangyf/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-OCR"
 
-    def __init__(self, config: DeepseekV2Config):
-        super(DeepseekOCRModel, self).__init__(config)
 
-        self.sam_model = build_sam_vit_b()
+class QwenOCRModel(Qwen2Model):
+    config_class = QwenOCRConfig
+
+    def __init__(self, config: Qwen2Config):
+        super().__init__(config)
+        
+        # -----------------------------------------------------------
+        # 1. 初始化 DeepSeek-OCR 的视觉编码器
+        # -----------------------------------------------------------
+        # 仅构建结构，权重统一由 _load_pretrained_weights 加载
+        self.sam_model = build_sam_vit_b(checkpoint=None)
         self.vision_model = build_clip_l()
-        # self.conv_2 = nn.Conv2d(in_channels=1024, out_channels=2048, kernel_size=2, stride=2)
-        n_embed = 1280
-        self.projector =  MlpProjector(Dict(projector_type="linear", input_dim=2048, n_embed=n_embed))
-        embed_std = 1 / torch.sqrt(torch.tensor(n_embed, dtype=torch.float32))
-        self.image_newline = nn.Parameter(torch.randn(n_embed) * embed_std)
-        self.view_seperator = nn.Parameter(torch.randn(n_embed) * embed_std)
 
+        # -----------------------------------------------------------
+        # 2. 初始化 Projector (关键适配层)
+        # -----------------------------------------------------------
+        # 视觉特征的输入维度固定为 2048 (由 SAM+CLIP 拼接逻辑决定)
+        # 输出维度必须等于 LLM 的 hidden_size (Qwen2.5-32B 为 5120)
+        # 注意：这里的权重是随机初始化的，必须经过训练！
+        self.projector = MlpProjector(Dict(projector_type="linear", input_dim=2048, n_embed=config.hidden_size))
 
+        # -----------------------------------------------------------
+        # 3. 初始化特殊 Token 参数
+        # -----------------------------------------------------------
+        embed_std = 1 / torch.sqrt(torch.tensor(config.hidden_size, dtype=torch.float32))
+        self.image_newline = nn.Parameter(torch.randn(config.hidden_size) * embed_std)
+        self.view_seperator = nn.Parameter(torch.randn(config.hidden_size) * embed_std)
 
-    
+        # -----------------------------------------------------------
+        # 4. 加载预训练权重 (DeepSeek-OCR 原版权重)
+        # -----------------------------------------------------------
+        # 优先使用 config.deepseek_ocr_checkpoint，其次 vision_checkpoint
+        ocr_checkpoint = getattr(config, 'deepseek_ocr_checkpoint', None) or getattr(config, 'vision_checkpoint', None)
+        if ocr_checkpoint:
+            self._load_pretrained_weights(ocr_checkpoint)
+            
+    def _load_pretrained_weights(self, model_path: str): 
+         """ 
+         加载预训练权重 
+ 
+         支持的格式： 
+         1. 单个 .bin / .pt 文件 
+         2. 文件夹（包含多个 .bin / .safetensors 文件） 
+         """ 
+         print(f"[DeepEncoder] Loading weights from {model_path}...") 
+         state_dict = self._load_state_dict(model_path)
+         # for name,model in self.sam_model.named_modules():
+         #     print( name)
+ 
+         # 加载 SAM 权重 
+         sam_keys = {k.replace('model.sam_model.', ''): v for k, v in state_dict.items() if 'sam_model' in k}
+         if sam_keys: 
+             missing, unexpected = self.sam_model.load_state_dict(sam_keys, strict=False) 
+             print(f"[DeepEncoder SAM] Loaded {len(sam_keys)} keys (missing: {len(missing)}, unexpected: {len(unexpected)})") 
+ 
+         # 加载 CLIP 权重 
+         clip_keys = {k.replace('model.vision_model.', ''): v for k, v in state_dict.items() if 'vision_model' in k}
+         if clip_keys: 
+             missing, unexpected = self.vision_model.load_state_dict(clip_keys, strict=False) 
+             print(f"[DeepEncoder CLIP] Loaded {len(clip_keys)} keys (missing: {len(missing)}, unexpected: {len(unexpected)})") 
+
+         # 加载 newline 权重
+         if 'image_newline' in state_dict:
+             self.image_newline.data = state_dict['image_newline']
+             print("[DeepEncoder] Loaded image_newline")
+ 
+    def _load_state_dict(self, model_path: str) -> dict: 
+         """加载 state dict（支持单文件和文件夹）""" 
+         if os.path.isfile(model_path): 
+             return torch.load(model_path, map_location='cpu') 
+ 
+         # 文件夹模式：合并所有权重文件 
+         state_dict = {} 
+         for f in os.listdir(model_path): 
+             file_path = os.path.join(model_path, f) 
+             if f.endswith('.bin') or f.endswith('.pt'): 
+                 state_dict.update(torch.load(file_path, map_location='cpu')) 
+             elif f.endswith('.safetensors'): 
+                 try: 
+                     from safetensors.torch import load_file 
+                     state_dict.update(load_file(file_path)) 
+                 except ImportError: 
+                     print("[Warning] safetensors not installed, skipping .safetensors files") 
+         return state_dict
+
     def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        images: Optional[torch.FloatTensor] = None,
-        images_seq_mask: Optional[torch.FloatTensor] = None,
-        images_spatial_crop: Optional[torch.FloatTensor] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
-
-
-
-
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            images: Optional[List[torch.FloatTensor]] = None,
+            images_seq_mask: Optional[torch.Tensor] = None,
+            images_spatial_crop: Optional[torch.Tensor] = None,
+    ):
+        # 1. 获取文本 Embedding
         if inputs_embeds is None:
-            # inputs_embeds = self.embed_tokens(input_ids)
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids)
 
-
-
-        sam_model = getattr(self, 'sam_model', None)
-        # sam_model = self.sam_model
-        vision_model = getattr(self, 'vision_model', None)
-
-
-
-        if sam_model is not None and (input_ids.shape[1] != 1 or self.training) and torch.sum(images[0][1]).item() != 0:
+        # 2. 注入图像 Embedding (逻辑移植自 DeepseekOCRModel)
+        if images is not None and len(images) > 0 and (input_ids is None or input_ids.shape[1] != 1 or self.training) and torch.sum(images[0][1]).item() != 0:
 
             idx = 0
-            
-            # sam_model = torch.jit.script(sam_model)
-            
-            # start_time = time.time()
             for image, crop_shape in zip(images, images_spatial_crop):
                 images_in_this_batch = []
+                patches = image[0]  # [P, C, H, W]
+                image_ori = image[1]  # [1, C, H, W]
 
-                patches = image[0]
-                image_ori = image[1]
+                # 提取视觉特征
+                # 注意：这里假设处于训练模式或 forward 上下文
+                if torch.sum(patches).item() != 0:
+                    local_features_1 = self.sam_model(patches)
+                    local_features_2 = self.vision_model(patches, local_features_1)
+                    local_features = torch.cat((local_features_2[:, 1:], local_features_1.flatten(2).permute(0, 2, 1)),
+                                               dim=-1)
+                    local_features = self.projector(local_features)
 
-                with torch.no_grad():
-                # with torch.inference_mode(): 
-                    
-                    if torch.sum(patches).item() != 0:
-                        # P, C, H, W = patches.shape
-                        crop_flag = 1
-                        local_features_1 = sam_model(patches)
+                    global_features_1 = self.sam_model(image_ori)
+                    global_features_2 = self.vision_model(image_ori, global_features_1)
+                    global_features = torch.cat(
+                        (global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+                    global_features = self.projector(global_features)
 
-                        local_features_2 = vision_model(patches, local_features_1)  
-                        # vit_time = time.time()
-                        local_features = torch.cat((local_features_2[:, 1:], local_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
-                        local_features = self.projector(local_features)
+                    # 形状变换与特殊 Token 拼接
+                    _, hw, n_dim = global_features.shape
+                    h = w = int(hw ** 0.5)
+                    _2, hw2, n_dim2 = local_features.shape
+                    h2 = w2 = int(hw2 ** 0.5)
 
+                    width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
 
-                        global_features_1 = sam_model(image_ori)
-                        global_features_2 = vision_model(image_ori, global_features_1) 
-                        global_features = torch.cat((global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
-                        global_features = self.projector(global_features)
+                    global_features = global_features.view(h, w, n_dim)
+                    global_features = torch.cat(
+                        [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+                    )
+                    global_features = global_features.view(-1, n_dim)
 
-                        print('=====================')
-                        print('BASE: ', global_features.shape)
-                        print('PATCHES: ', local_features.shape)
-                        print('=====================')
+                    local_features = local_features.view(height_crop_num, width_crop_num, h2, w2, n_dim2).permute(0, 2,
+                                                                                                                  1, 3,
+                                                                                                                  4).reshape(
+                        height_crop_num * h2, width_crop_num * w2, n_dim2)
+                    local_features = torch.cat(
+                        [local_features, self.image_newline[None, None, :].expand(height_crop_num * h2, 1, n_dim2)],
+                        dim=1
+                    )
+                    local_features = local_features.view(-1, n_dim2)
 
-                        _, hw, n_dim = global_features.shape
-                        h = w = int(hw ** 0.5)
+                    global_local_features = torch.cat([local_features, global_features, self.view_seperator[None, :]],
+                                                      dim=0)
 
-                        _2, hw2, n_dim2 = local_features.shape
-                        h2 = w2 = int(hw2 ** 0.5)
+                else:
+                    # 仅全局视图
+                    global_features_1 = self.sam_model(image_ori)
+                    global_features_2 = self.vision_model(image_ori, global_features_1)
+                    global_features = torch.cat(
+                        (global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+                    global_features = self.projector(global_features)
 
-                        width_crop_num, height_crop_num = crop_shape[0], crop_shape[1]
+                    _, hw, n_dim = global_features.shape
+                    h = w = int(hw ** 0.5)
 
-                        global_features = global_features.view(h, w, n_dim)
+                    global_features = global_features.view(h, w, n_dim)
+                    global_features = torch.cat(
+                        [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
+                    )
+                    global_features = global_features.view(-1, n_dim)
+                    global_local_features = torch.cat([global_features, self.view_seperator[None, :]], dim=0)
 
-                        global_features = torch.cat(
-                            [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
-                        )
+                images_in_this_batch.append(global_local_features)
 
-                        global_features = global_features.view(-1, n_dim)
-
-
-                        local_features = local_features.view(height_crop_num, width_crop_num, h2, w2, n_dim2).permute(0, 2, 1, 3, 4).reshape(height_crop_num*h2, width_crop_num*w2, n_dim2)
-                        local_features = torch.cat(
-                            [local_features, self.image_newline[None, None, :].expand(height_crop_num * h2, 1, n_dim2)], dim=1
-                        )
-                        local_features = local_features.view(-1, n_dim2)
-
-                        global_local_features = torch.cat([local_features, global_features, self.view_seperator[None, :]], dim=0)
-
-                        # end_time = time.time()
-
-                        # print('sam: ', sam_time - start_time)
-                        # print('vit: ', vit_time - sam_time)
-                        # print('all: ', end_time - start_time)
-
-                        # exit()
-                   
-                    else:
-                        global_features_1 = sam_model(image_ori)
-                        global_features_2 = vision_model(image_ori, global_features_1) 
-                        global_features = torch.cat((global_features_2[:, 1:], global_features_1.flatten(2).permute(0, 2, 1)), dim=-1) 
-                        global_features = self.projector(global_features)
-                        print('=====================')
-                        print('BASE: ', global_features.shape)
-                        print('NO PATCHES')
-                        print('=====================')
-                        _, hw, n_dim = global_features.shape
-                        h = w = int(hw ** 0.5)
-
-
-                        global_features = global_features.view(h, w, n_dim)
-
-                        global_features = torch.cat(
-                            [global_features, self.image_newline[None, None, :].expand(h, 1, n_dim)], dim=1
-                        )
-
-                        global_features = global_features.view(-1, n_dim)
-
-                        global_local_features = torch.cat([global_features, self.view_seperator[None, :]], dim=0)
-
-                    images_in_this_batch.append(global_local_features)
-                
-
-                # print(inputs_embeds.shape)
-
+                # 将图像特征填入 inputs_embeds
                 if images_in_this_batch:
                     images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
-                    # exit()
-
-                    inputs_embeds[idx].masked_scatter_(images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch)
+                    inputs_embeds[idx].masked_scatter_(
+                        images_seq_mask[idx].unsqueeze(-1).to(inputs_embeds.device),
+                        images_in_this_batch.to(inputs_embeds.device)
+                    )
 
                 idx += 1
-            
 
-        return super(DeepseekOCRModel, self).forward(
-            input_ids=None, attention_mask=attention_mask, past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds, use_cache=use_cache, position_ids = position_ids,
-            output_attentions=output_attentions, output_hidden_states=output_hidden_states,
-            return_dict=return_dict
+        return super().forward(
+            input_ids=None,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
         )
-    
 
-class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
 
-    config_class = DeepseekOCRConfig
-    # supports_gradient_checkpointing = True
+class QwenOCRForCausalLM(Qwen2ForCausalLM):
+    config_class = QwenOCRConfig
 
     def __init__(self, config):
-        super(DeepseekV2ForCausalLM, self).__init__(config)
-        self.model = DeepseekOCRModel(config)
+        # 使用 Qwen2PreTrainedModel 初始化，避免创建重复的 Qwen2Model
+        super(Qwen2ForCausalLM, self).__init__(config)
 
+        self.model = QwenOCRModel(config)
         self.vocab_size = config.vocab_size
-
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
         self.post_init()
 
     def get_model(self):
         return self.model
 
-
     def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        images: Optional[torch.FloatTensor] = None,
-        images_seq_mask: Optional[torch.FloatTensor] = None,
-        images_spatial_crop: Optional[torch.FloatTensor] = None,
-        return_dict: Optional[bool] = None,
-        
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            images: Optional[List[torch.FloatTensor]] = None,
+            images_seq_mask: Optional[torch.Tensor] = None,
+            images_spatial_crop: Optional[torch.Tensor] = None,
+            cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-
-
-        outputs  = self.model(
+        # 3. 调用 QwenOCRModel 的 forward
+        outputs = self.model(
             input_ids=input_ids,
-            past_key_values=past_key_values,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            cache_position=cache_position,
             images=images,
-            images_seq_mask = images_seq_mask,
-            images_spatial_crop = images_spatial_crop,
-            return_dict=return_dict
-            
+            images_seq_mask=images_seq_mask,
+            images_spatial_crop=images_spatial_crop,
         )
-
-
-        
-        # print(transformer_outputs)
 
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         logits = logits.float()
-
-        # logits
 
         loss = None
         if labels is not None:
@@ -594,7 +608,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
+            loss_fct = nn.CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
@@ -613,82 +627,37 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
             attentions=outputs.attentions,
         )
 
-
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
-        # Omit tokens covered by past_key_values
-        past_length = 0
-        if past_key_values is not None:
-            if isinstance(past_key_values, Cache):
-                cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
-                max_cache_length = past_key_values.get_max_length()
-            else:
-                cache_length = past_length = past_key_values[0][0].shape[2]
-                max_cache_length = None
-
-            # Keep only the unprocessed tokens:
-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
-            # input)
-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-            # input_ids based on the past_length.
-            elif past_length < input_ids.shape[1]:
-                input_ids = input_ids[:, past_length:]
-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
-
-            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
-            if (
-                max_cache_length is not None
-                and attention_mask is not None
-                and cache_length + input_ids.shape[1] > max_cache_length
-            ):
-                attention_mask = attention_mask[:, -max_cache_length:]
-
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-
-        # if self.generation_config.cache_implementation == "static":
-        #     # generation with static cache
-        #     cache_position = kwargs.get("cache_position", None)
-        #     if cache_position is None:
-        #         past_length = 0
-        #     else:
-        #         past_length = cache_position[-1] + 1
-        #     input_ids = input_ids[:, past_length:]
-        #     position_ids = position_ids[:, past_length:]
-
-        # TODO @gante we should only keep a `cache_position` in generate, and do +=1.
-        # same goes for position ids. Could also help with continued generation.
-        cache_position = torch.arange(past_length, past_length + position_ids.shape[-1], device=position_ids.device)
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs
+        )
+        
+        images_seq_mask = kwargs.get("images_seq_mask", None)
+        if images_seq_mask is not None:
+            cache_position = model_inputs.get("cache_position")
+            if cache_position is not None:
+                bsz = images_seq_mask.shape[0]
+                seq_len = cache_position.shape[0]
+                new_mask = torch.zeros((bsz, seq_len), dtype=images_seq_mask.dtype, device=images_seq_mask.device)
+                
+                valid_mask = cache_position < images_seq_mask.shape[1]
+                valid_indices = cache_position[valid_mask]
+                
+                if valid_indices.numel() > 0:
+                    new_mask[:, valid_mask] = images_seq_mask[:, valid_indices]
+                
+                images_seq_mask = new_mask
+        
         model_inputs.update(
             {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
                 "images": kwargs.get("images", None),
-                "images_seq_mask": kwargs.get("images_seq_mask", None),
+                "images_seq_mask": images_seq_mask,
                 "images_spatial_crop": kwargs.get("images_spatial_crop", None),
             }
         )
         return model_inputs
-    
 
     def disable_torch_init(self):
         """
@@ -698,10 +667,10 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         setattr(torch.nn.Linear, "reset_parameters", lambda self: None)
         setattr(torch.nn.LayerNorm, "reset_parameters", lambda self: None)
 
-
-
     def infer(self, tokenizer, prompt='', image_file='', output_path = '', base_size=1024, image_size=640, crop_mode=True, test_compress=False, save_results=False, eval_mode=False):
+        
         self.disable_torch_init()
+        device = self.model.device
 
         os.makedirs(output_path, exist_ok=True)
         os.makedirs(f'{output_path}/images', exist_ok=True)
@@ -757,8 +726,8 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         image_transform=BasicImageTransform(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), normalize=True)
         images_seq_mask = []
 
-        image_token = '<image>'
-        image_token_id = 128815
+        image_token = '<|image_pad|>'
+        image_token_id = 151655
         text_splits = prompt.split(image_token)
 
         images_list, images_crop_list, images_seq_mask = [], [], []
@@ -795,10 +764,6 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
                 # elif base_size == 640:
                 #     valid_img_tokens += int(100 * ratio)
                 
-
-
-
-                
                 images_list.append(image_transform(global_view).to(torch.bfloat16))
 
                 # global_view_tensor = image_transform(global_view).to(torch.bfloat16)
@@ -820,11 +785,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
                 num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
                 num_queries_base = math.ceil((base_size // patch_size) / downsample_ratio)
 
-
-
                 """add image tokens"""
-
-                
 
                 tokenized_image = ([image_token_id] * num_queries_base + [image_token_id]) * num_queries_base
                 tokenized_image += [image_token_id]
@@ -880,7 +841,10 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         images_seq_mask += [False] * len(tokenized_sep)
 
         """add the bos tokens"""
-        bos_id = 0
+        # "bos_token_id": 151643,
+        # "decoder_sparse_step": 1,
+        # "eos_token_id": 151645,
+        bos_id = 151643
         tokenized_str = [bos_id] + tokenized_str 
         images_seq_mask = [False] + images_seq_mask
 
@@ -911,43 +875,43 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
 
         if not eval_mode:
             streamer = NoEOSTextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(device.type, dtype=torch.bfloat16):
                 with torch.no_grad():
                     output_ids = self.generate(
-                        input_ids.unsqueeze(0).cuda(),
-                        images=[(images_crop.cuda(), images_ori.cuda())],
-                        images_seq_mask = images_seq_mask.unsqueeze(0).cuda(),
+                        input_ids.unsqueeze(0).to(device),
+                        images=[(images_crop.to(device), images_ori.to(device))],
+                        images_seq_mask = images_seq_mask.unsqueeze(0).to(device),
                         images_spatial_crop = images_spatial_crop,
-                        # do_sample=False,
+                        do_sample=False,
                         # num_beams = 1,
-                        temperature=0.0,
+                        # temperature=0.0,
                         eos_token_id=tokenizer.eos_token_id,
                         streamer=streamer,
-                        max_new_tokens=8192,
+                        max_new_tokens=1024,
                         no_repeat_ngram_size = 20,
                         use_cache = True
                         )
 
         else:
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(device.type, dtype=torch.bfloat16):
                 with torch.no_grad():
                     output_ids = self.generate(
-                        input_ids.unsqueeze(0).cuda(),
-                        images=[(images_crop.cuda(), images_ori.cuda())],
-                        images_seq_mask = images_seq_mask.unsqueeze(0).cuda(),
+                        input_ids.unsqueeze(0).to(device),
+                        images=[(images_crop.to(device), images_ori.to(device))],
+                        images_seq_mask = images_seq_mask.unsqueeze(0).to(device),
                         images_spatial_crop = images_spatial_crop,
-                        # do_sample=False,
+                        do_sample=False,
                         # num_beams = 1,
-                        temperature=0.0,
+                        # temperature=0.0,
                         eos_token_id=tokenizer.eos_token_id,
-                        max_new_tokens=8192,
+                        max_new_tokens=1024,
                         no_repeat_ngram_size = 35,
                         use_cache = True
                         )
                 
 
         if '<image>' in conversation[0]['content'] and eval_mode:
-                outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).cuda().shape[1]:])
+                outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).to(device).shape[1]:])
                 stop_str = '<｜end▁of▁sentence｜>'
                 if outputs.endswith(stop_str):
                     outputs = outputs[:-len(stop_str)]
@@ -957,7 +921,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
                 return outputs
         
         if '<image>' in conversation[0]['content'] and test_compress:
-            outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).cuda().shape[1]:])
+            outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).to(device).shape[1]:])
             pure_texts_outputs_token_length = len(text_encode(tokenizer, outputs, bos=False, eos=False))
             print('='*50)
             print('image size: ', (w, h))
@@ -968,7 +932,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
 
 
         if '<image>' in conversation[0]['content'] and save_results:
-            outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).cuda().shape[1]:])
+            outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).to(device).shape[1]:])
             stop_str = '<｜end▁of▁sentence｜>'
 
             print('='*15 + 'save results:' + '='*15)
