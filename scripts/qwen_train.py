@@ -138,6 +138,7 @@ def main():
         args=training_args,
         train_dataset=dataset,
         data_collator=data_collator,
+        tokenizer=tokenizer,
     )
 
     # 7. 开始训练
@@ -152,7 +153,7 @@ def main():
     # 8. 保存模型
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
-    tokenizer.save_pretrained(training_args.output_dir)
+    # tokenizer.save_pretrained(training_args.output_dir)
 
 
 if __name__ == "__main__":
