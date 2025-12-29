@@ -111,13 +111,13 @@ class DeepSeekOCRDataCollator:
     train_on_responses_only: bool = True
 
     def __init__(
-            self,
-            tokenizer,
-            model,
-            image_size: int = 640,
-            base_size: int = 1024,
-            crop_mode: bool = True,
-            train_on_responses_only: bool = True,
+        self,
+        tokenizer,
+        model,
+        image_size: int = 640,
+        base_size: int = 1024,
+        crop_mode: bool = True,
+        train_on_responses_only: bool = True,
     ):
         self.tokenizer = tokenizer
         self.model = model
@@ -151,6 +151,9 @@ class DeepSeekOCRDataCollator:
             image_bytes = image_data['bytes']
             image = Image.open(io.BytesIO(image_bytes))
             return image.convert("RGB")
+        elif isinstance(image_data, str):
+            image = Image.open(image_data).convert("RGB")
+            return image
         else:
             raise ValueError(f"Unsupported image format: {type(image_data)}")
 
@@ -218,7 +221,7 @@ class DeepSeekOCRDataCollator:
 
             if width_crop_num > 1 or height_crop_num > 1:
                 tokenized_image += ([self.image_token_id] * (num_queries * width_crop_num) + [self.image_token_id]) * (
-                        num_queries * height_crop_num)
+                    num_queries * height_crop_num)
 
         else:  # crop_mode = False
             crop_ratio = (1, 1)
@@ -242,121 +245,108 @@ class DeepSeekOCRDataCollator:
         return images_list, images_crop_list, images_spatial_crop, tokenized_image, crop_ratio
 
     def process_single_sample(self, messages: List[Dict]) -> Dict[str, Any]:
-        """
-        Process a single conversation into model inputs.
-        """
+            """
+            Process a single conversation into model inputs.
+            """
 
-        # --- 1. Setup ---
-        images = []
-        for message in messages:
-            if "images" in message and message["images"]:
-                # 您的数据中 "images" 是单个字符串路径，或者是列表？
-                # 根据您提供的 JSONL 样例： "images": "/path/to/image.png"
-                # 所以这里需要做兼容处理
-                img_data_list = message["images"]
-                if isinstance(img_data_list, str):
-                    img_data_list = [img_data_list]
-
-                for img_path in img_data_list:
-                    if img_path:
-                        # 使用 PIL.Image.open 加载图片
-                        try:
-                            pil_image = Image.open(img_path).convert("RGB")
+            # --- 1. Setup ---
+            images = []
+            for message in messages:
+                if "images" in message and message["images"]:
+                    for img_path in message["images"]:
+                        if img_path is not None:
+                            pil_image = self.deserialize_image(img_path)
                             images.append(pil_image)
-                        except Exception as e:
-                            print(f"Error loading image {img_path}: {e}")
-                            # 可以选择抛出异常或使用占位图
-                            raise e
 
-        if not images:
-            raise ValueError("No images found in sample. Please ensure all samples contain images.")
+            if not images:
+                raise ValueError("No images found in sample. Please ensure all samples contain images.")
 
-        tokenized_str = []
-        images_seq_mask = []
-        images_list, images_crop_list, images_spatial_crop = [], [], []
+            tokenized_str = []
+            images_seq_mask = []
+            images_list, images_crop_list, images_spatial_crop = [], [], []
 
-        prompt_token_count = -1  # Index to start training
-        assistant_started = False
-        image_idx = 0
+            prompt_token_count = -1 # Index to start training
+            assistant_started = False
+            image_idx = 0
 
-        # Add BOS token at the very beginning
-        tokenized_str.append(self.bos_id)
-        images_seq_mask.append(False)
+            # Add BOS token at the very beginning
+            tokenized_str.append(self.bos_id)
+            images_seq_mask.append(False)
 
-        for message in messages:
-            role = message["role"]
-            content = message["content"]
+            for message in messages:
+                role = message["role"]
+                content = message["content"]
 
-            # Check if this is the assistant's turn
-            if role == "<|Assistant|>":
-                if not assistant_started:
-                    # This is the split point. All tokens added *so far*
-                    # are part of the prompt.
-                    prompt_token_count = len(tokenized_str)
-                    assistant_started = True
+                # Check if this is the assistant's turn
+                if role == "assistant":
+                    if not assistant_started:
+                        # This is the split point. All tokens added *so far*
+                        # are part of the prompt.
+                        prompt_token_count = len(tokenized_str)
+                        assistant_started = True
 
-                # Append the EOS token string to the *end* of assistant content
-                content = f"{content.strip()} {self.tokenizer.eos_token}"
+                    # Append the EOS token string to the *end* of assistant content
+                    content = f"{content.strip()} {self.tokenizer.eos_token}"
 
-            # Split this message's content by the image token
-            text_splits = content.split('<image>')
+                # Split this message's content by the image token
+                text_splits = content.split('<image>')
 
-            for i, text_sep in enumerate(text_splits):
-                # Tokenize the text part
-                tokenized_sep = text_encode(self.tokenizer, text_sep, bos=False, eos=False)
-                tokenized_str.extend(tokenized_sep)
-                images_seq_mask.extend([False] * len(tokenized_sep))
+                for i, text_sep in enumerate(text_splits):
+                    # Tokenize the text part
+                    tokenized_sep = text_encode(self.tokenizer, text_sep, bos=False, eos=False)
+                    tokenized_str.extend(tokenized_sep)
+                    images_seq_mask.extend([False] * len(tokenized_sep))
 
-                # If this text is followed by an <image> tag
-                if i < len(text_splits) - 1:
-                    if image_idx >= len(images):
-                        raise ValueError(
-                            f"Data mismatch: Found '<image>' token but no corresponding image."
-                        )
+                    # If this text is followed by an <image> tag
+                    if i < len(text_splits) - 1:
+                        if image_idx >= len(images):
+                            raise ValueError(
+                                f"Data mismatch: Found '<image>' token but no corresponding image."
+                            )
 
-                    # Process the image
-                    image = images[image_idx]
-                    img_list, crop_list, spatial_crop, tok_img, _ = self.process_image(image)
+                        # Process the image
+                        image = images[image_idx]
+                        img_list, crop_list, spatial_crop, tok_img, _ = self.process_image(image)
 
-                    images_list.extend(img_list)
-                    images_crop_list.extend(crop_list)
-                    images_spatial_crop.extend(spatial_crop)
+                        images_list.extend(img_list)
+                        images_crop_list.extend(crop_list)
+                        images_spatial_crop.extend(spatial_crop)
 
-                    # Add image placeholder tokens
-                    tokenized_str.extend(tok_img)
-                    images_seq_mask.extend([True] * len(tok_img))
+                        # Add image placeholder tokens
+                        tokenized_str.extend(tok_img)
+                        images_seq_mask.extend([True] * len(tok_img))
 
-                    image_idx += 1  # Move to the next image
+                        image_idx += 1 # Move to the next image
 
-        # --- 3. Validation and Final Prep ---
-        if image_idx != len(images):
-            raise ValueError(
-                f"Data mismatch: Found {len(images)} images but only {image_idx} '<image>' tokens were used."
-            )
+            # --- 3. Validation and Final Prep ---
+            if image_idx != len(images):
+                raise ValueError(
+                    f"Data mismatch: Found {len(images)} images but only {image_idx} '<image>' tokens were used."
+                )
 
-        # If we never found an assistant message, we're in a weird state
-        # (e.g., user-only prompt). We mask everything.
-        if not assistant_started:
-            print("Warning: No assistant message found in sample. Masking all tokens.")
-            prompt_token_count = len(tokenized_str)
+            # If we never found an assistant message, we're in a weird state
+            # (e.g., user-only prompt). We mask everything.
+            if not assistant_started:
+                print("Warning: No assistant message found in sample. Masking all tokens.")
+                prompt_token_count = len(tokenized_str)
 
-        # Prepare image tensors
-        images_ori = torch.stack(images_list, dim=0)
-        images_spatial_crop_tensor = torch.tensor(images_spatial_crop, dtype=torch.long)
+            # Prepare image tensors
+            images_ori = torch.stack(images_list, dim=0)
+            images_spatial_crop_tensor = torch.tensor(images_spatial_crop, dtype=torch.long)
 
-        if images_crop_list:
-            images_crop = torch.stack(images_crop_list, dim=0)
-        else:
-            images_crop = torch.zeros((1, 3, self.base_size, self.base_size), dtype=self.dtype)
+            if images_crop_list:
+                images_crop = torch.stack(images_crop_list, dim=0)
+            else:
+                images_crop = torch.zeros((1, 3, self.base_size, self.base_size), dtype=self.dtype)
 
-        return {
-            "input_ids": torch.tensor(tokenized_str, dtype=torch.long),
-            "images_seq_mask": torch.tensor(images_seq_mask, dtype=torch.bool),
-            "images_ori": images_ori,
-            "images_crop": images_crop,
-            "images_spatial_crop": images_spatial_crop_tensor,
-            "prompt_token_count": prompt_token_count,  # This is now accurate
-        }
+            return {
+                "input_ids": torch.tensor(tokenized_str, dtype=torch.long),
+                "images_seq_mask": torch.tensor(images_seq_mask, dtype=torch.bool),
+                "images_ori": images_ori,
+                "images_crop": images_crop,
+                "images_spatial_crop": images_spatial_crop_tensor,
+                "prompt_token_count": prompt_token_count, # This is now accurate
+            }
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         """Collate batch of samples"""
