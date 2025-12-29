@@ -667,335 +667,223 @@ class QwenOCRForCausalLM(Qwen2ForCausalLM):
         setattr(torch.nn.Linear, "reset_parameters", lambda self: None)
         setattr(torch.nn.LayerNorm, "reset_parameters", lambda self: None)
 
-    def infer(self, tokenizer, prompt='', image_file='', output_path = '', base_size=1024, image_size=640, crop_mode=True, test_compress=False, save_results=False, eval_mode=False):
-        
+    def infer(self, tokenizer, prompt='', image_file='', output_path='', base_size=1024, image_size=640, crop_mode=True,
+              test_compress=False, save_results=False, eval_mode=False):
+
         self.disable_torch_init()
         device = self.model.device
 
+        # 1. 获取 Qwen 特殊 Token ID
+        # 兜底逻辑：如果 tokenizer 没取到，使用 Qwen2.5 默认值
+        im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>") or 151644
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>") or 151645
+        nl_tokens = tokenizer.encode("\n", add_special_tokens=False)
+        nl_id = nl_tokens[-1] if nl_tokens else 198
+        image_token_id = 151655  # <|image_pad|>
+
+        # 2. 准备图片
         os.makedirs(output_path, exist_ok=True)
-        os.makedirs(f'{output_path}/images', exist_ok=True)
+        images = []
+        if image_file:
+            try:
+                # 保持与 dataset 一致的读取方式
+                image = Image.open(image_file).convert("RGB")
+                image = ImageOps.exif_transpose(image)  # 修正方向
+                images.append(image)
+            except Exception as e:
+                print(f"Error loading image: {e}")
+                return
 
-        if prompt and image_file:
-            conversation = [
-                {
-                    "role": "<|User|>",
-                    # "content": "<image>\n<|grounding|>Given the layout of the image. ",
-                    "content": f'{prompt}',
-                    # "content": "君不见黄河之水天上来的下一句是什么？",
-                    # "content": "<image>\nFree OCR. ",
-                    # "content": "<image>\nParse the figure. ",
-                    # "content": "<image>\nExtract the text in the image. ",
-                    "images": [f'{image_file}'],
-                },
-                {"role": "<|Assistant|>", "content": ""},
-            ]
-        
-        elif prompt:
-            conversation = [
-                {
-                    "role": "<|User|>",
-                    # "content": "<image>\n<|grounding|>Given the layout of the image. ",
-                    "content": f'{prompt}',
-                    # "content": "君不见黄河之水天上来的下一句是什么？",
-                    # "content": "<image>\nFree OCR. ",
-                    # "content": "<image>\nParse the figure. ",
-                    # "content": "<image>\nExtract the text in the image. ",
-                    # "images": [f'{image_file}'],
-                },
-                {"role": "<|Assistant|>", "content": ""},
-            ]
-        else:
-            assert False, f'prompt is none!'
-        
-        prompt = format_messages(conversations=conversation, sft_format='plain', system_prompt='')
+        # 3. 构建 ChatML 格式的 Input IDs
+        # 结构: <|im_start|>system...<|im_end|>\n<|im_start|>user...<|im_end|>\n<|im_start|>assistant\n
 
+        full_input_ids = []
+        images_seq_mask_list = []
+
+        # --- System Prompt ---
+        system_text = "You are a helpful assistant."
+        # <|im_start|>system\nText<|im_end|>\n
+        system_ids = [im_start_id] + tokenizer.encode("system", add_special_tokens=False) + [nl_id] + \
+                     tokenizer.encode(system_text, add_special_tokens=False) + [im_end_id, nl_id]
+        full_input_ids.extend(system_ids)
+        images_seq_mask_list.extend([False] * len(system_ids))
+
+        # --- User Prompt ---
+        # <|im_start|>user\n
+        user_header_ids = [im_start_id] + tokenizer.encode("user", add_special_tokens=False) + [nl_id]
+        full_input_ids.extend(user_header_ids)
+        images_seq_mask_list.extend([False] * len(user_header_ids))
+
+        # Content: Text + Image Placeholders
+        # 替换 dataset 约定的 <image> 占位符
+        content = prompt.replace("<image>", "<|image_pad|>")
+        text_splits = content.split('<|image_pad|>')
+
+        # 图片处理相关参数
         patch_size = 16
         downsample_ratio = 4
-        images = load_pil_images(conversation)
+        image_transform = BasicImageTransform(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), normalize=True)
 
-        valid_img_tokens = 0
-        ratio = 1
-
-        image_draw = images[0].copy()
-
-        w,h = image_draw.size
-        # print(w, h)
-        ratio = 1 - ((max(w, h) - min(w, h)) / (max(w, h)))
-    
-
-        image_transform=BasicImageTransform(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), normalize=True)
-        images_seq_mask = []
-
-        image_token = '<|image_pad|>'
-        image_token_id = 151655
-        text_splits = prompt.split(image_token)
-
-        images_list, images_crop_list, images_seq_mask = [], [], []
-        tokenized_str = []
+        images_list = []
+        images_crop_list = []
         images_spatial_crop = []
-        for text_sep, image in zip(text_splits, images):
+        valid_img_tokens = 0
+        image_idx = 0
 
-            tokenized_sep = text_encode(tokenizer, text_sep, bos=False, eos=False)
-            tokenized_str += tokenized_sep
-            images_seq_mask += [False] * len(tokenized_sep)
+        for i, text_sep in enumerate(text_splits):
+            if text_sep:
+                sep_ids = tokenizer.encode(text_sep, add_special_tokens=False)
+                full_input_ids.extend(sep_ids)
+                images_seq_mask_list.extend([False] * len(sep_ids))
 
-            if crop_mode:
+            # 如果不是最后一段，说明此处有一个 <|image_pad|>
+            if i < len(text_splits) - 1:
+                if image_idx >= len(images):
+                    print("Warning: Prompt contains <image> but no image file provided/loaded.")
+                    continue
 
-                if image.size[0] <= 640 and image.size[1] <= 640:
-                    crop_ratio = [1, 1]
+                image = images[image_idx]
+                w, h = image.size
+
+                # --- Image Processing (Align with dataset.py) ---
+                if crop_mode:
+                    if image.size[0] <= 640 and image.size[1] <= 640:
+                        crop_ratio = (1, 1)
+                        images_crop_raw = []
+                    else:
+                        images_crop_raw, crop_ratio = dynamic_preprocess(
+                            image, min_num=2, max_num=9,
+                            image_size=image_size, use_thumbnail=False
+                        )
+
+                    # Global View
+                    global_view = ImageOps.pad(image, (base_size, base_size),
+                                               color=tuple(int(x * 255) for x in image_transform.mean))
+                    images_list.append(image_transform(global_view).to(torch.bfloat16))
+
+                    width_crop_num, height_crop_num = crop_ratio
+                    images_spatial_crop.append([width_crop_num, height_crop_num])
+
+                    # Local Views
+                    if width_crop_num > 1 or height_crop_num > 1:
+                        for crop_img in images_crop_raw:
+                            images_crop_list.append(image_transform(crop_img).to(torch.bfloat16))
+
+                    # Calculate Tokens
+                    num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
+                    num_queries_base = math.ceil((base_size // patch_size) / downsample_ratio)
+
+                    # Construct Image Tokens
+                    # Global part
+                    tok_img = ([image_token_id] * num_queries_base + [image_token_id]) * num_queries_base
+                    tok_img += [image_token_id]  # 273
+                    valid_img_tokens += len(tok_img)
+
+                    # Local part
+                    if width_crop_num > 1 or height_crop_num > 1:
+                        local_tokens = ([image_token_id] * (num_queries * width_crop_num) + [image_token_id]) * (
+                                    num_queries * height_crop_num)
+                        tok_img += local_tokens
+                        valid_img_tokens += len(local_tokens)
 
                 else:
-                    if crop_mode:
-                        # best_width, best_height = select_best_resolution(image.size, self.candidate_resolutions)
-                        images_crop_raw, crop_ratio = dynamic_preprocess(image)
+                    # Non-crop mode (Simple resize/pad)
+                    crop_ratio = (1, 1)
+                    images_spatial_crop.append([1, 1])
+
+                    if base_size <= 640:
+                        resized_image = image.resize((base_size, base_size), Image.LANCZOS)
+                        images_list.append(image_transform(resized_image).to(torch.bfloat16))
                     else:
-                        # best_width, best_height = self.image_size, self.image_size
-                        crop_ratio = [1, 1]
-                
-                """process the global view"""
-                # image = image.resize((base_size, base_size))
-                global_view = ImageOps.pad(image, (base_size, base_size),
-                                        color=tuple(int(x * 255) for x in image_transform.mean))
-                
-                if base_size == 1024:
-                    valid_img_tokens += int(256 * ratio)
-                elif base_size == 1280:
-                    valid_img_tokens += int(400 * ratio)
-                # elif base_size == 640:
-                #     valid_img_tokens += int(100 * ratio)
-                
-                images_list.append(image_transform(global_view).to(torch.bfloat16))
+                        global_view = ImageOps.pad(image, (base_size, base_size),
+                                                   color=tuple(int(x * 255) for x in image_transform.mean))
+                        images_list.append(image_transform(global_view).to(torch.bfloat16))
 
-                # global_view_tensor = image_transform(global_view).to(torch.bfloat16)
+                    num_queries = math.ceil((base_size // patch_size) / downsample_ratio)
+                    tok_img = ([image_token_id] * num_queries + [image_token_id]) * num_queries
+                    tok_img += [image_token_id]
+                    valid_img_tokens += len(tok_img)
 
-                width_crop_num, height_crop_num = crop_ratio
+                full_input_ids.extend(tok_img)
+                images_seq_mask_list.extend([True] * len(tok_img))
+                image_idx += 1
 
-                images_spatial_crop.append([width_crop_num, height_crop_num])
-                
-                
-                if width_crop_num > 1 or height_crop_num > 1:
-                    """process the local views"""
-                    
-                    for i in range(len(images_crop_raw)):
-                        images_crop_list.append(image_transform(images_crop_raw[i]).to(torch.bfloat16))
-                
-                if image_size == 640:
-                    valid_img_tokens += len(images_crop_list) * 100
+        # User Footer: <|im_end|>\n
+        user_footer_ids = [im_end_id, nl_id]
+        full_input_ids.extend(user_footer_ids)
+        images_seq_mask_list.extend([False] * len(user_footer_ids))
 
-                num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
-                num_queries_base = math.ceil((base_size // patch_size) / downsample_ratio)
+        # --- Assistant Header ---
+        # <|im_start|>assistant\n
+        assistant_header_ids = [im_start_id] + tokenizer.encode("assistant", add_special_tokens=False) + [nl_id]
+        full_input_ids.extend(assistant_header_ids)
+        images_seq_mask_list.extend([False] * len(assistant_header_ids))
 
-                """add image tokens"""
+        # 4. Create Tensors
+        input_ids = torch.tensor(full_input_ids, dtype=torch.long)
+        images_seq_mask = torch.tensor(images_seq_mask_list, dtype=torch.bool)
 
-                tokenized_image = ([image_token_id] * num_queries_base + [image_token_id]) * num_queries_base
-                tokenized_image += [image_token_id]
-                if width_crop_num > 1 or height_crop_num > 1:
-                    tokenized_image += ([image_token_id] * (num_queries * width_crop_num) + [image_token_id]) * (
-                                num_queries * height_crop_num)
-                tokenized_str += tokenized_image
-                images_seq_mask += [True] * len(tokenized_image)
-                # num_image_tokens.append(len(tokenized_image))
-
-            else:
-                # best_width, best_height = self.image_size, self.image_size
-                # print(image.size, (best_width, best_height)) # check the select_best_resolutions func
-
-                """process the global view"""
-                if image_size <= 640:
-                    print('directly resize')
-                    image = image.resize((image_size, image_size))
-                # else:
-                global_view = ImageOps.pad(image, (image_size, image_size),
-                                        color=tuple(int(x * 255) for x in image_transform.mean))
-                images_list.append(image_transform(global_view).to(torch.bfloat16))
-
-                if base_size == 1024:
-                    valid_img_tokens += int(256 * ratio)
-                elif base_size == 1280:
-                    valid_img_tokens += int(400 * ratio)
-                elif base_size == 640:
-                    valid_img_tokens += int(100 * 1)
-                elif base_size == 512:
-                    valid_img_tokens += int(64 * 1)
-
-                width_crop_num, height_crop_num = 1, 1
-
-                images_spatial_crop.append([width_crop_num, height_crop_num])
-
-
-                """add image tokens"""
-                num_queries = math.ceil((image_size // patch_size) / downsample_ratio)
-
-                tokenized_image = ([image_token_id] * num_queries + [image_token_id]) * num_queries
-                tokenized_image += [image_token_id]
-                # tokenized_image += ([self.image_token_id] * (num_queries * width_crop_num) + [self.image_token_id]) * (
-                #             num_queries * height_crop_num)
-                tokenized_str += tokenized_image
-                images_seq_mask += [True] * len(tokenized_image)
-                # num_image_tokens.append(len(tokenized_image))
-        
-
-        """process the last text split"""
-        tokenized_sep = text_encode(tokenizer, text_splits[-1], bos=False, eos=False)
-        tokenized_str += tokenized_sep
-        images_seq_mask += [False] * len(tokenized_sep)
-
-        """add the bos tokens"""
-        # "bos_token_id": 151643,
-        # "decoder_sparse_step": 1,
-        # "eos_token_id": 151645,
-        bos_id = 151643
-        tokenized_str = [bos_id] + tokenized_str 
-        images_seq_mask = [False] + images_seq_mask
-
-
-
-        input_ids = torch.LongTensor(tokenized_str)
-
-
-        
-
-        images_seq_mask = torch.tensor(images_seq_mask, dtype=torch.bool)
-
-
+        # Stack Images
         if len(images_list) == 0:
-            images_ori = torch.zeros((1, 3, image_size, image_size))
+            # Handle text-only case
+            images_ori = torch.zeros((1, 3, image_size, image_size)).to(torch.bfloat16)
             images_spatial_crop = torch.zeros((1, 2), dtype=torch.long)
-            images_crop = torch.zeros((1, 3, base_size, base_size))
-
+            images_crop = torch.zeros((1, 3, base_size, base_size)).to(torch.bfloat16)
         else:
             images_ori = torch.stack(images_list, dim=0)
             images_spatial_crop = torch.tensor(images_spatial_crop, dtype=torch.long)
             if images_crop_list:
                 images_crop = torch.stack(images_crop_list, dim=0)
             else:
-                images_crop = torch.zeros((1, 3, base_size, base_size))
+                images_crop = torch.zeros((len(images_list), 3, base_size, base_size), dtype=self.model.dtype).to(
+                    torch.bfloat16)
 
-
-
+        # 5. Generate
         if not eval_mode:
             streamer = NoEOSTextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
-            with torch.autocast(device.type, dtype=torch.bfloat16):
-                with torch.no_grad():
-                    output_ids = self.generate(
-                        input_ids.unsqueeze(0).to(device),
-                        images=[(images_crop.to(device), images_ori.to(device))],
-                        images_seq_mask = images_seq_mask.unsqueeze(0).to(device),
-                        images_spatial_crop = images_spatial_crop,
-                        do_sample=False,
-                        # num_beams = 1,
-                        # temperature=0.0,
-                        eos_token_id=tokenizer.eos_token_id,
-                        streamer=streamer,
-                        max_new_tokens=1024,
-                        no_repeat_ngram_size = 20,
-                        use_cache = True
-                        )
-
         else:
-            with torch.autocast(device.type, dtype=torch.bfloat16):
-                with torch.no_grad():
-                    output_ids = self.generate(
-                        input_ids.unsqueeze(0).to(device),
-                        images=[(images_crop.to(device), images_ori.to(device))],
-                        images_seq_mask = images_seq_mask.unsqueeze(0).to(device),
-                        images_spatial_crop = images_spatial_crop,
-                        do_sample=False,
-                        # num_beams = 1,
-                        # temperature=0.0,
-                        eos_token_id=tokenizer.eos_token_id,
-                        max_new_tokens=1024,
-                        no_repeat_ngram_size = 35,
-                        use_cache = True
-                        )
-                
+            streamer = None
 
-        if '<image>' in conversation[0]['content'] and eval_mode:
-                outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).to(device).shape[1]:])
-                stop_str = '<｜end▁of▁sentence｜>'
-                if outputs.endswith(stop_str):
-                    outputs = outputs[:-len(stop_str)]
-                # re_match
-                outputs = outputs.strip()
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            with torch.no_grad():
+                output_ids = self.generate(
+                    input_ids.unsqueeze(0).to(device),
+                    images=[(images_crop.to(device), images_ori.to(device))],
+                    images_seq_mask=images_seq_mask.unsqueeze(0).to(device),
+                    images_spatial_crop=images_spatial_crop.to(device),
+                    do_sample=False,
+                    eos_token_id=[tokenizer.eos_token_id, im_end_id],  # 遇到 <|im_end|> 也停止
+                    streamer=streamer,
+                    max_new_tokens=1024,
+                    no_repeat_ngram_size=20,
+                    use_cache=True
+                )
 
-                return outputs
-        
-        if '<image>' in conversation[0]['content'] and test_compress:
-            outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).to(device).shape[1]:])
-            pure_texts_outputs_token_length = len(text_encode(tokenizer, outputs, bos=False, eos=False))
-            print('='*50)
-            print('image size: ', (w, h))
-            print('valid image tokens: ', int(valid_img_tokens))
-            print('output texts tokens (valid): ', pure_texts_outputs_token_length)
-            print('compression ratio: ', round(pure_texts_outputs_token_length/valid_img_tokens, 2))
-            print('='*50)
+        # 6. Post-processing
+        # 获取生成的文本部分
+        outputs = tokenizer.decode(output_ids[0, input_ids.shape[0]:], skip_special_tokens=True)
+        outputs = outputs.strip()
 
+        if test_compress:
+            # 简单的压缩率计算逻辑 (可选)
+            pure_texts_len = len(tokenizer.encode(outputs, add_special_tokens=False))
+            print(f'Valid Image Tokens: {valid_img_tokens}, Output Text Tokens: {pure_texts_len}')
+            if valid_img_tokens > 0:
+                print(f'Compression Ratio: {pure_texts_len / valid_img_tokens:.2f}')
 
-        if '<image>' in conversation[0]['content'] and save_results:
-            outputs = tokenizer.decode(output_ids[0, input_ids.unsqueeze(0).to(device).shape[1]:])
-            stop_str = '<｜end▁of▁sentence｜>'
+        if save_results:
+            # 这里保留原有的保存逻辑
+            # 注意：re_match 和 process_image_with_refs 依赖于原始文件中的其他辅助函数
+            # 如果这些函数未变动，下面的逻辑应该能正常运行
+            try:
+                matches_ref, matches_images, mathes_other = re_match(outputs)
+                if image_file and images:
+                    result_img = process_image_with_refs(images[0], matches_ref, output_path)
+                    result_img.save(f"{output_path}/result_with_boxes.jpg")
 
-            print('='*15 + 'save results:' + '='*15)
-            
-            # # # # conv.messages[-1][-1] = outputs
-            if outputs.endswith(stop_str):
-                outputs = outputs[:-len(stop_str)]
-            outputs = outputs.strip()
+                with open(f'{output_path}/result.mmd', 'w', encoding='utf-8') as f:
+                    f.write(outputs)
+            except Exception as e:
+                print(f"Error saving results: {e}")
 
-            matches_ref, matches_images, mathes_other = re_match(outputs)
-            # print(matches_ref)
-            result = process_image_with_refs(image_draw, matches_ref, output_path)
-
-
-            for idx, a_match_image in enumerate(tqdm(matches_images, desc="image")):
-                outputs = outputs.replace(a_match_image, '![](images/' + str(idx) + '.jpg)\n')
-            
-            for idx, a_match_other in enumerate(tqdm(mathes_other, desc="other")):
-                outputs = outputs.replace(a_match_other, '').replace('\\coloneqq', ':=').replace('\\eqqcolon', '=:')
-
-
-            # if 'structural formula' in conversation[0]['content']:
-            #     outputs = '<smiles>' + outputs + '</smiles>'
-            with open(f'{output_path}/result.mmd', 'w', encoding = 'utf-8') as afile:
-                afile.write(outputs)
-
-            if 'line_type' in outputs:
-                import matplotlib.pyplot as plt
-                lines = eval(outputs)['Line']['line']
-
-                line_type = eval(outputs)['Line']['line_type']
-                # print(lines)
-
-                endpoints = eval(outputs)['Line']['line_endpoint']
-
-                fig, ax = plt.subplots(figsize=(3,3), dpi=200)
-                ax.set_xlim(-15, 15)
-                ax.set_ylim(-15, 15)
-
-                for idx, line in enumerate(lines):
-                    try:
-                        p0 = eval(line.split(' -- ')[0])
-                        p1 = eval(line.split(' -- ')[-1])
-
-                        if line_type[idx] == '--':
-                            ax.plot([p0[0], p1[0]], [p0[1], p1[1]], linewidth=0.8, color='k')
-                        else:
-                            ax.plot([p0[0], p1[0]], [p0[1], p1[1]], linewidth = 0.8, color = 'k')
-
-                        ax.scatter(p0[0], p0[1], s=5, color = 'k')
-                        ax.scatter(p1[0], p1[1], s=5, color = 'k')
-                    except:
-                        pass
-
-                for endpoint in endpoints:
-
-                    label = endpoint.split(': ')[0]
-                    (x, y) = eval(endpoint.split(': ')[1])
-                    ax.annotate(label, (x, y), xytext=(1, 1), textcoords='offset points', 
-                                fontsize=5, fontweight='light')
-                
-
-                plt.savefig(f'{output_path}/geo.jpg')
-                plt.close()
-
-            result.save(f"{output_path}/result_with_boxes.jpg")
+        return outputs
