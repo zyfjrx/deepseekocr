@@ -1,0 +1,139 @@
+DeepseekOCRForCausalLM(
+  (model): DeepseekOCRModel(
+    (embed_tokens): Embedding(129280, 1280)
+    (layers): ModuleList(
+      (0): DeepseekV2DecoderLayer(
+        (self_attn): LlamaAttention(
+          (q_proj): Linear(in_features=1280, out_features=1280, bias=False)
+          (k_proj): Linear(in_features=1280, out_features=1280, bias=False)
+          (v_proj): Linear(in_features=1280, out_features=1280, bias=False)
+          (o_proj): Linear(in_features=1280, out_features=1280, bias=False)
+          (rotary_emb): LlamaRotaryEmbedding()
+        )
+        (mlp): DeepseekV2MLP(
+          (gate_proj): Linear(in_features=1280, out_features=6848, bias=False)
+          (up_proj): Linear(in_features=1280, out_features=6848, bias=False)
+          (down_proj): Linear(in_features=6848, out_features=1280, bias=False)
+          (act_fn): SiLU()
+        )
+        (input_layernorm): DeepseekV2RMSNorm()
+        (post_attention_layernorm): DeepseekV2RMSNorm()
+      )
+      (1-11): 11 x DeepseekV2DecoderLayer(
+        (self_attn): LlamaAttention(
+          (q_proj): Linear(in_features=1280, out_features=1280, bias=False)
+          (k_proj): Linear(in_features=1280, out_features=1280, bias=False)
+          (v_proj): Linear(in_features=1280, out_features=1280, bias=False)
+          (o_proj): Linear(in_features=1280, out_features=1280, bias=False)
+          (rotary_emb): LlamaRotaryEmbedding()
+        )
+        (mlp): DeepseekV2MoE(
+          (experts): ModuleList(
+            (0-63): 64 x DeepseekV2MLP(
+              (gate_proj): Linear(in_features=1280, out_features=896, bias=False)
+              (up_proj): Linear(in_features=1280, out_features=896, bias=False)
+              (down_proj): Linear(in_features=896, out_features=1280, bias=False)
+              (act_fn): SiLU()
+            )
+          )
+          (gate): MoEGate()
+          (shared_experts): DeepseekV2MLP(
+            (gate_proj): Linear(in_features=1280, out_features=1792, bias=False)
+            (up_proj): Linear(in_features=1280, out_features=1792, bias=False)
+            (down_proj): Linear(in_features=1792, out_features=1280, bias=False)
+            (act_fn): SiLU()
+          )
+        )
+        (input_layernorm): DeepseekV2RMSNorm()
+        (post_attention_layernorm): DeepseekV2RMSNorm()
+      )
+    )
+    (norm): DeepseekV2RMSNorm()
+    (sam_model): ImageEncoderViT(
+      (patch_embed): PatchEmbed(
+        (proj): Conv2d(3, 768, kernel_size=(16, 16), stride=(16, 16))
+      )
+      (blocks): ModuleList(
+        (0-11): 12 x Block(
+          (norm1): LayerNorm((768,), eps=1e-06, elementwise_affine=True)
+          (attn): Attention(
+            (qkv): Linear(in_features=768, out_features=2304, bias=True)
+            (proj): Linear(in_features=768, out_features=768, bias=True)
+          )
+          (norm2): LayerNorm((768,), eps=1e-06, elementwise_affine=True)
+          (mlp): MLPBlock(
+            (lin1): Linear(in_features=768, out_features=3072, bias=True)
+            (lin2): Linear(in_features=3072, out_features=768, bias=True)
+            (act): GELU(approximate='none')
+          )
+        )
+      )
+      (neck): Sequential(
+        (0): Conv2d(768, 256, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        (1): LayerNorm2d()
+        (2): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+        (3): LayerNorm2d()
+      )
+      (net_2): Conv2d(256, 512, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+      (net_3): Conv2d(512, 1024, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+    )
+    (vision_model): VitModel(
+      (embeddings): CLIPVisionEmbeddings(
+        (patch_embedding): Conv2d(3, 1024, kernel_size=(14, 14), stride=(14, 14), bias=False)
+        (position_embedding): Embedding(257, 1024)
+      )
+      (transformer): NoTPTransformer(
+        (layers): ModuleList(
+          (0-23): 24 x NoTPTransformerBlock(
+            (self_attn): NoTPAttention(
+              (qkv_proj): Linear(in_features=1024, out_features=3072, bias=True)
+              (out_proj): Linear(in_features=1024, out_features=1024, bias=True)
+            )
+            (mlp): NoTPFeedForward(
+              (fc1): Linear(in_features=1024, out_features=4096, bias=True)
+              (fc2): Linear(in_features=4096, out_features=1024, bias=True)
+            )
+            (layer_norm1): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+            (layer_norm2): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+          )
+        )
+      )
+      (pre_layrnorm): LayerNorm((1024,), eps=1e-05, elementwise_affine=True)
+    )
+    (projector): MlpProjector(
+      (layers): Linear(in_features=2048, out_features=1280, bias=True)
+    )
+    (ecg_encoder): ECGEncoderWrapper(
+      (model): EcgTransformer(
+        (conv1): Conv1d(12, 768, kernel_size=(50,), stride=(50,), bias=False)
+        (patch_dropout): Identity()
+        (ln_pre): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+        (transformer): Transformer(
+          (resblocks): ModuleList(
+            (0-11): 12 x ResidualAttentionBlock(
+              (ln_1): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+              (attn): MultiheadAttention(
+                (out_proj): NonDynamicallyQuantizableLinear(in_features=768, out_features=768, bias=True)
+              )
+              (ls_1): Identity()
+              (ln_2): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+              (mlp): Sequential(
+                (c_fc): Linear(in_features=768, out_features=3072, bias=True)
+                (gelu): GELU(approximate='none')
+                (c_proj): Linear(in_features=3072, out_features=768, bias=True)
+              )
+              (ls_2): Identity()
+            )
+          )
+        )
+        (ln_post): LayerNorm((768,), eps=1e-05, elementwise_affine=True)
+      )
+    )
+    (ecg_projector): Sequential(
+      (0): Linear(in_features=768, out_features=1280, bias=True)
+      (1): GELU(approximate='none')
+      (2): Linear(in_features=1280, out_features=1280, bias=True)
+    )
+  )
+  (lm_head): Linear(in_features=1280, out_features=129280, bias=False)
+)
