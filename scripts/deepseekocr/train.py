@@ -1,13 +1,13 @@
 import torch
 from transformers import AutoTokenizer,Trainer,TrainingArguments
 from peft import LoraConfig, get_peft_model, TaskType
-from dataset import ECGInstructionDataset,DeepSeekOCRDataCollator
+from scripts.deepseekocr.dataset import ECGInstructionDataset,DeepSeekOCRDataCollator
 from models.modeling_deepseekocr import DeepseekOCRForCausalLM
 
 
 
-MODEL_PATH = "deepseek-ai/DeepSeek-OCR" # 或者是本地路径
-data_path = "/Users/zhangyf/PycharmProjects/cfel/deepseekocr/data/deepseek_ocr_ecg_future.jsonl"
+MODEL_PATH = "checkpoint/deepseek-ai/DeepSeek-OCR"  # 或者是本地路径
+data_path = "/data/deepseek_ocr_ecg_future.jsonl"
 output_dir = "./checkpoints_ocr"
 
 def print_trainable_parameters(model):

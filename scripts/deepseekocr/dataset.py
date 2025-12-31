@@ -411,7 +411,7 @@ class DeepSeekOCRDataCollator:
 
 if __name__ == '__main__':
     MODEL_PATH = "deepseek-ai/DeepSeek-OCR" # 或者是本地路径
-    data_path = "/Users/zhangyf/PycharmProjects/cfel/deepseekocr/data/deepseek_ocr_ecg_future.jsonl"
+    data_path = "/data/deepseek_ocr_ecg_future.jsonl"
     dataset = ECGInstructionDataset(data_path)
     print(dataset[0])
     print(len( dataset))
