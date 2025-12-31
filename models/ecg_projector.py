@@ -2,8 +2,6 @@ import torch
 import torch.nn as nn
 import re
 
-from transformers import MistralForQuestionAnswering
-from configuration_deepseek_v2 import DeepseekV2Config
 
 class IdentityMap(nn.Module):
     def __init__(self):
@@ -27,24 +25,27 @@ class SimpleResBlock(nn.Module):
             nn.GELU(),
             nn.Linear(channels, channels)
         )
-
     def forward(self, x):
         x = self.pre_norm(x)
         return x + self.proj(x)
 
 
-def build_ecg_projector(ecg_embed,n_embed):
-    ecg_embed = 768
-    n_embed = 1280
-    modules = [nn.Linear(ecg_embed, n_embed)]
-    for _ in range(1, 2):
-        modules.append(nn.GELU())
-        modules.append(nn.Linear(n_embed, n_embed))
-    return nn.Sequential(*modules)
+def build_ecg_projector(config):
+    projector_type = getattr(config, 'mm_projector_type', 'linear')
 
-if __name__ == '__main__':
-    class DeepseekOCRConfig(DeepseekV2Config):
-        model_type = "DeepseekOCR"
-    config = DeepseekOCRConfig()
-    proj = build_ecg_projector(config)
-    print(proj)
+    if projector_type == 'linear':
+        return nn.Linear(config.ecg_hidden_size, config.hidden_size)
+
+    mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', projector_type)
+    if mlp_gelu_match:
+        mlp_depth = int(mlp_gelu_match.group(1))
+        modules = [nn.Linear(config.ecg_hidden_size, config.hidden_size)]
+        for _ in range(1, mlp_depth):
+            modules.append(nn.GELU())
+            modules.append(nn.Linear(config.hidden_size, config.hidden_size))
+        return nn.Sequential(*modules)
+
+    if projector_type == 'identity':
+        return IdentityMap()
+
+    raise ValueError(f'Unknown projector type: {projector_type}')

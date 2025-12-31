@@ -28,8 +28,8 @@ class ECGEncoderWrapper(nn.Module):
 
     def forward(self, ecg_signal):
         """
-        输入: ecg_signal [Batch, Channels, Length]
-        输出: features [Batch, Seq_Len, Dim]
+        in: ecg_signal [Batch, Channels, Length]
+        out: features [Batch, Seq_Len, Dim]
         """
         with torch.no_grad():
             ecg_features = self.model(ecg_signal,output_last_transformer_layer=True)
