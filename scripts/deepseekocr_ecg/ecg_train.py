@@ -49,6 +49,10 @@ class DataArguments:
         default=1024,
         metadata={"help": "Base size for global view."}
     )
+    max_length: int = field(
+        default=4096,
+        metadata={"help": "Base size for global view."}
+    )
 
 #
 def print_trainable_parameters(model):
@@ -169,7 +173,8 @@ def main():
         image_size=data_args.image_size,
         base_size=data_args.base_size,
         crop_mode=True,
-        train_on_responses_only=True
+        train_on_responses_only=True,
+        max_length=data_args.max_length,
     )
 
     # 6. Trainer

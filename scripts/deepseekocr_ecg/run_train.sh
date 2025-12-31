@@ -20,6 +20,7 @@ torchrun --nproc_per_node=$NUM_GPUS --master_port=29501 qwen_train.py \
     --ecg_weight_path $ECG_WEIGHT_PATH \
     --data_path $DATA_PATH \
     --output_dir $OUTPUT_DIR \
+    --max_length 8196 \
     --deepspeed ds_config_zero2.json \
     --bf16 True \
     --num_train_epochs 6 \

@@ -123,7 +123,8 @@ class DeepSeekOCRDataCollator:
             train_on_responses_only: bool = True,
             ecg_root_path: str = "",
             ecg_token_len: int = 101,
-            ecg_dropout_prob: float = 0.0
+            ecg_dropout_prob: float = 0.0,
+            max_length: int = 1024,
     ):
         self.tokenizer = tokenizer
         self.model = model
@@ -133,6 +134,7 @@ class DeepSeekOCRDataCollator:
         self.image_token_id = 128815  # 使用 <image> token ID 作为通用占位符
         self.dtype = model.dtype
         self.train_on_responses_only = train_on_responses_only
+        self.max_length = max_length
 
         # ECG 设置
         self.ecg_root_path = ecg_root_path
@@ -230,7 +232,6 @@ class DeepSeekOCRDataCollator:
         else:
             raise ValueError(f"Unsupported image format: {type(image_data)}")
 
-
     def process_image(self, image: Image.Image) -> Tuple[List, List, List, List, Tuple[int, int]]:
         """
         Process a single image based on crop_mode and size thresholds
@@ -279,7 +280,7 @@ class DeepSeekOCRDataCollator:
 
             if width_crop_num > 1 or height_crop_num > 1:
                 tokenized_image += ([self.image_token_id] * (num_queries * width_crop_num) + [self.image_token_id]) * (
-                    num_queries * height_crop_num)
+                        num_queries * height_crop_num)
 
         else:  # crop_mode = False
             crop_ratio = (1, 1)
@@ -430,7 +431,16 @@ class DeepSeekOCRDataCollator:
 
         if not assistant_started:
             print("Warning: No assistant message found in sample. Masking all tokens.")
-            prompt_token_count = len(tokenized_str)
+            if len(tokenized_str) > self.max_length:
+                prompt_token_count = self.max_length
+            else:
+                prompt_token_count = len(tokenized_str)
+
+        # todo add max_length
+        if len(tokenized_str) > self.max_length:
+            tokenized_str = tokenized_str[:self.max_length]
+            ecg_seq_mask = ecg_seq_mask[:self.max_length]
+            images_seq_mask = images_seq_mask[:self.max_length]
 
         return {
             "input_ids": torch.tensor(tokenized_str, dtype=torch.long),
@@ -556,6 +566,3 @@ if __name__ == '__main__':
     # output = model.forward(**result)
     # print(output.loss.item())
     # model.save_pretrained("deepseek-ai/DeepSeek-OCR-ecg")
-
-
-
