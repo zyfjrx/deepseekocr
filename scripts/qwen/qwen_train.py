@@ -88,7 +88,15 @@ def main():
         # 也可以指定 e.g. tokenizer.pad_token_id = 151643
 
     # 2. 加载数据集
-    dataset = ECGInstructionDataset(jsonl_file=data_args.data_path)
+
+    full_dataset = ECGInstructionDataset(jsonl_file=data_args.data_path)
+
+    # 手动按比例切分 (例如 99% 训练，1% 验证)
+    train_size = int(0.99 * len(full_dataset))
+    eval_size = len(full_dataset) - train_size
+    train_dataset, eval_dataset = torch.utils.data.random_split(full_dataset, [train_size, eval_size])
+
+    print(f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}")
 
     # 3. 加载模型
     print(f"Loading model from {model_args.model_name_or_path}...")
@@ -136,7 +144,8 @@ def main():
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         tokenizer=tokenizer,
     )

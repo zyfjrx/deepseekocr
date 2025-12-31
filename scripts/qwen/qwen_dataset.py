@@ -367,17 +367,26 @@ class QwenOCRDataCollator:
 if __name__ == '__main__':
     # 请确保路径正确
     MODEL_PATH = "/Users/zhangyf/llm/Qwen2.5-0.5B-Instruct"
-    data_path = "/checkpoint/tt.jsonl"
+    data_path = "/data/deepseek_ocr_instruct.jsonl"
 
     # 初始化
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = QwenOCRForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16)
+    # model = QwenOCRForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16)
 
-    dataset = ECGInstructionDataset(data_path)
-    data_collator = QwenOCRDataCollator(tokenizer=tokenizer, model=model)
+    full_dataset = ECGInstructionDataset(data_path)
+    # full_dataset = ECGInstructionDataset(jsonl_file=data_args.data_path)
+
+    # 手动按比例切分 (例如 99% 训练，1% 验证)
+    train_size = int(0.99 * len(full_dataset))
+    eval_size = len(full_dataset) - train_size
+    train_dataset, eval_dataset = torch.utils.data.random_split(full_dataset, [train_size, eval_size])
+
+    print(f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}")
+    print( "Train dataset:", train_dataset[0])
+    # data_collator = QwenOCRDataCollator(tokenizer=tokenizer, model=model)
 
     # if len(dataset) > 0:
     #     batch = data_collator([dataset[0]])
@@ -396,7 +405,7 @@ if __name__ == '__main__':
     #         print(f"Training starts at index {first_trainable}, token: {tokenizer.decode([ids[first_trainable]])}")
     #     except StopIteration:
     #         print("Warning: All labels are masked!")
-    batch = data_collator(dataset)
+    # batch = data_collator(dataset)
     # output = model.forward(**batch)
     # out = model.infer()
     # print(out)
