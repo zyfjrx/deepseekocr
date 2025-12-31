@@ -2,3 +2,4 @@
 /docs/
 /data/
 /checkpoint/
+/utils/grounding_train_prompt_30k.jsonl
