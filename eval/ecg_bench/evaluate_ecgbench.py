@@ -505,7 +505,7 @@ def eval_g12_test(dir):
 
 if __name__ == "__main__":
     # root = "/home/zyf/gem_deepseek/data/ecg-bench"
-    root = "/Users/zhangyf/Documents/cfel/GEM/eval_outputs/cfel-ecg-qwen-7B-0908-100K/ecg-bench-test"
+    root = "/home/zyf/ecg_deepseekocr/ecg_bench/eval_outputs/deepseekocr-ecg/ecg-bench-test"
 
     # eval_ptb_test(f"{root}/ptb-test")
     eval_cpsc_test(f"{root}/cpsc-test")

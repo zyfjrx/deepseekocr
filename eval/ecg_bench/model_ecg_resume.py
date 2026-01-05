@@ -111,6 +111,8 @@ def eval_model(args):
         # _attn_implementation="flash_attention_2"
     )
 
+    model.eval().cuda()
+
     
     questions = []
     with open(args.question_file, "r") as f:
