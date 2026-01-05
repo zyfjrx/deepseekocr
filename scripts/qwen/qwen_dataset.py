@@ -9,8 +9,9 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer
 from torch.utils.data import Dataset
 
+from models.deepencoder import build_sam_vit_b, build_clip_l
 # 【修改点1】移除错误的 text_encode 引用
-from models.modeling_qwen_ocr import (
+from models.modeling_qwen3_ocr_ori import (
     BasicImageTransform,
     dynamic_preprocess,
     QwenOCRForCausalLM
@@ -354,6 +355,13 @@ class QwenOCRDataCollator:
         else:
             images_spatial_crop = torch.empty((0, 2), dtype=torch.long)
 
+        print("----"*50)
+        total_tokens = labels.numel()  # 总格子数
+        masked_tokens = (labels == -100).sum().item()  # 被忽略的格子数 (-100)
+        valid_tokens = total_tokens - masked_tokens  # 有效学习的格子数
+        print(f"\n[DEBUG] Batch统计: 总Tokens={total_tokens} | 被Mask={masked_tokens} | 有效Tokens={valid_tokens}")
+        print("----"*50)
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -366,46 +374,85 @@ class QwenOCRDataCollator:
 
 if __name__ == '__main__':
     # 请确保路径正确
-    MODEL_PATH = "/Users/zhangyf/llm/Qwen2.5-0.5B-Instruct"
-    data_path = "/data/deepseek_ocr_instruct.jsonl"
+    MODEL_PATH = "/Users/zhangyf/llm/Qwen3-0.6B"
+    data_path = "/Users/zhangyf/PycharmProjects/cfel/deepseekocr/data/deepseek_ocr_ecg_future_18.jsonl"
 
     # 初始化
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # model = QwenOCRForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16)
+    model = QwenOCRForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16)
+    # 加载 deepencode权重
+    model.model.sam_model = build_sam_vit_b().to(dtype=model.dtype)
+    model.model.vision_model = build_clip_l().to(dtype=model.dtype)
+    root_path = "/Users/zhangyf/llm/DeepEncoder/"
+    model.model.sam_model.load_state_dict(torch.load(root_path + "sam_encoder.pth"))
+    model.model.vision_model.load_state_dict(torch.load(root_path + "clip_encoder.pth"))
+    embed_std = 1 / torch.sqrt(torch.tensor(model.config.hidden_size, dtype=torch.bfloat16))
+    model.model.image_newline =  torch.nn.Parameter(torch.randn(model.config.hidden_size,dtype=model.dtype) * embed_std)
+    model.model.view_seperator =  torch.nn.Parameter(torch.randn(model.config.hidden_size,dtype=model.dtype) * embed_std)
 
-    full_dataset = ECGInstructionDataset(data_path)
-    # full_dataset = ECGInstructionDataset(jsonl_file=data_args.data_path)
-
-    # 手动按比例切分 (例如 99% 训练，1% 验证)
-    train_size = int(0.99 * len(full_dataset))
-    eval_size = len(full_dataset) - train_size
-    train_dataset, eval_dataset = torch.utils.data.random_split(full_dataset, [train_size, eval_size])
-
-    print(f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}")
-    print( "Train dataset:", train_dataset[0])
+    # dataset = ECGInstructionDataset(data_path)
+    # #
     # data_collator = QwenOCRDataCollator(tokenizer=tokenizer, model=model)
-
-    # if len(dataset) > 0:
-    #     batch = data_collator([dataset[0]])
-    #     print("Input IDs:", batch['input_ids'].shape)
-    #     print("Labels:", batch['labels'].shape)
-    #
-    #     # 简单验证解码 (只打印前50个token)
-    #     ids = batch['input_ids'][0].tolist()
-    #     print("Decoded start:", tokenizer.decode(ids[:50]))
-    #
-    #     # 验证 Labels 是否正确 mask 掉了 user 部分
-    #     lbs = batch['labels'][0].tolist()
-    #     # 找到第一个不为 -100 的地方
-    #     try:
-    #         first_trainable = next(i for i, x in enumerate(lbs) if x != -100)
-    #         print(f"Training starts at index {first_trainable}, token: {tokenizer.decode([ids[first_trainable]])}")
-    #     except StopIteration:
-    #         print("Warning: All labels are masked!")
     # batch = data_collator(dataset)
+    # print(batch.keys())
     # output = model.forward(**batch)
+    # 推理参数
+    # def print_trainable_parameters(model):
+    #     trainable_params = 0
+    #     all_param = 0
+    #     print("\n=== 当前开启梯度的层 (Trainable Layers) ===")
+    #     for name, param in model.named_parameters():
+    #         all_param += param.numel()
+    #         if param.requires_grad:
+    #             trainable_params += param.numel()
+    #             print(f"✅ {name} ({param.numel()} params)")
+    #
+    #     print(f"\n=== 统计结果 ===")
+    #     print(f"总参数量: {all_param}")
+    #     print(f"可训练参数: {trainable_params}")
+    #     print(f"可训练比例: {100 * trainable_params / all_param:.4f}%")
+
+
+    # for name, param in model.named_parameters():
+    #     # 这里的命名依据是 modeling_qwen_ocr.py 中的结构
+    #     # QwenOCRModel 定义了 self.sam_model 和 self.vision_model
+    #     if "sam_model" in name or "vision_model" in name or "model.layers" in name:
+    #         param.requires_grad = False
+    #     else:
+    #         # LLM (model.layers), Projector (model.projector), Embeddings 保持训练
+    #         param.requires_grad = True
+    # # 再次确认 projector 是开启梯度的
+    # # model.model.projector 是对齐层
+    # for name, param in model.model.projector.named_parameters():
+    #     param.requires_grad = True
+    #
+    # print_trainable_parameters(model)
+
+    # output = model.forward(**batch)
+    # print(output.loss.item())
+    prompt = "<image>\n Interpret the provided ECG image, identify key features and abnormalities in each lead, and generate a clinical diagnosis that is supported by the observed evidence."
+    # image_file = './image_ds/gen_images/mimic_gen/p1079/p10792254/s42187992/42187992-0.png'
+    image_file = '/Users/zhangyf/Documents/cfel/images/p1968/p19680126/s41060732/41060732-0.png'
+    output_path = './output'
+    #
+    # # 执行推理
+    res = model.infer(
+        tokenizer=tokenizer,
+        prompt=prompt,
+        image_file=image_file,
+        output_path=output_path,
+        base_size=1024,
+        image_size=640,
+        crop_mode=True,
+        save_results=False,
+        test_compress=False
+    )
+    #
+    model.eval().to("cpu")
+    print(f"result:{res}")
+
     # out = model.infer()
     # print(out)

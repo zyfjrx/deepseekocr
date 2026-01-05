@@ -12,16 +12,18 @@ from transformers import (
 )
 import logging
 
+from models.deepencoder import build_sam_vit_b, build_clip_l
 # 导入你本地的模型和数据集代码
 # 假设你之前修改好的 dataset 代码保存为了 dataset.py
 from qwen_dataset import ECGInstructionDataset, QwenOCRDataCollator
-from models.modeling_qwen_ocr import QwenOCRForCausalLM
+from models.modeling_qwen3_ocr import QwenOCRForCausalLM
 
 
 @dataclass
 class ModelArguments:
     model_name_or_path: str = field(
-        default="/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/bb46c15ee4bb56c5b63245ef50fd7637234d6f75",
+        # default="/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/bb46c15ee4bb56c5b63245ef50fd7637234d6f75",
+        default="/root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     freeze_vision: bool = field(
@@ -106,7 +108,18 @@ def main():
         trust_remote_code=True
     )
 
-    # 开启梯度检查点 (节省显存，H800 显存够大可选择关闭以换取速度)
+    # 加载 deepencode权重
+    # model.model.sam_model = build_sam_vit_b().to(dtype=model.dtype)
+    # model.model.vision_model = build_clip_l().to(dtype=model.dtype)
+    # root_path = "/Users/zhangyf/llm/DeepEncoder/"
+    # model.model.sam_model.load_state_dict(torch.load(root_path + "sam_encoder.pth"))
+    # model.model.vision_model.load_state_dict(torch.load(root_path + "clip_encoder.pth"))
+    #
+    # embed_std = 1 / torch.sqrt(torch.tensor(model.config.hidden_size, dtype=torch.bfloat16))
+    # model.model.image_newline = torch.nn.Parameter(torch.randn(model.config.hidden_size, dtype=model.dtype) * embed_std)
+    # model.model.view_seperator = torch.nn.Parameter(torch.randn(model.config.hidden_size, dtype=model.dtype) * embed_std)
+
+    # 开启梯度检查点
     if training_args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -152,7 +165,7 @@ def main():
 
     # 7. 开始训练
     if list(path.iterdir()) if (
-    path := torch.load(os.path.join(training_args.output_dir, "trainer_state.json")) if os.path.exists(
+    path := torch.load(os.path.join(training_args.output_dir, "trainer_state.json"),weights_only=False) if os.path.exists(
             os.path.join(training_args.output_dir, "trainer_state.json")) else None) else None:
         # 简单的断点续训逻辑，实际使用可依赖 HF 的 resume_from_checkpoint 参数
         pass
