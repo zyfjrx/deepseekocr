@@ -519,7 +519,7 @@ class DeepseekOCRModel(DeepseekV2Model):
             ecg_features = self.ecg_projector(ecg_features.to(inputs_embeds.dtype))
 
             # 测试
-            ecg_features = ecg_features * 0.0
+            # ecg_features = ecg_features * 0.0
 
             # C. 拼接 Start/End 向量
             batch_size = ecg_features.shape[0]
@@ -535,6 +535,8 @@ class DeepseekOCRModel(DeepseekV2Model):
                 ecg_features,
                 end_token.to(ecg_features.dtype)
             ], dim=1)
+
+            print('ECG: ', ecg_final_embeds.shape)
 
             # D. 填入 inputs_embeds
             for idx in range(len(inputs_embeds)):
@@ -571,6 +573,9 @@ class DeepseekOCRModel(DeepseekV2Model):
             #                 ecg_seq_mask[idx].unsqueeze(-1).to(inputs_embeds.device),
             #                 valid_features
             #             )
+            print('=====================')
+            print(inputs_embeds.shape)
+            print('=====================')
 
         return super(DeepseekOCRModel, self).forward(
             input_ids=None, attention_mask=attention_mask, past_key_values=past_key_values,
@@ -666,6 +671,7 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            print(f"loss:==========={loss}")
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1116,28 +1122,29 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
         # ---------------------------------------------------------------
         ecg_tensor = None
         has_ecg = False
-
         if ecg_file:
             try:
                 import wfdb
                 import scipy.signal
-
-                # 读取逻辑 (与 Dataset 保持完全一致)
-                # 假设 ecg_file 是不带后缀的路径，或者带后缀
+                # 拼接完整路径逻辑 (与 Dataset 保持一致)
                 record_path = os.path.splitext(ecg_file)[0]
-
+                # 检查文件是否存在
                 if os.path.exists(record_path + ".hea") or os.path.exists(record_path + ".dat"):
+                    # 读取记录
                     record = wfdb.rdrecord(record_path)
-                    signal = record.p_signal
+                    signal = record.p_signal  # shape: (Samples, Channels)
+                    # === [关键修复 1] NaN/Inf 清洗 ===
+                    if np.isnan(signal).any() or np.isinf(signal).any():
+                        print(f"[Warning] NaN/Inf detected in inference file {ecg_file}, cleaning...")
+                        signal[np.isnan(signal)] = 0
+                        signal[np.isinf(signal)] = 0
                     original_fs = record.fs
                     target_fs = 500
                     target_len = 5000
-
                     # 重采样
                     if original_fs != target_fs:
                         new_len = int(signal.shape[0] * target_fs / original_fs)
                         signal = scipy.signal.resample(signal, new_len, axis=0)
-
                     # 截断/填充
                     L, C = signal.shape
                     if L > target_len:
@@ -1146,21 +1153,27 @@ class DeepseekOCRForCausalLM(DeepseekV2ForCausalLM):
                         pad_len = target_len - L
                         padding = np.zeros((pad_len, C))
                         signal = np.concatenate([signal, padding], axis=0)
-
                     # 转 Tensor [12, 5000]
-                    ecg_tensor = torch.tensor(signal.T, dtype=torch.float32).unsqueeze(0).to(device)  # [1, 12, 5000]
-
+                    # 注意：Dataset 中是 Transpose 过的，这里也必须保持一致 (Samples, Channels) -> (Channels, Samples)
+                    signal_tensor = torch.tensor(signal.T, dtype=torch.float32)
+                    # === [关键修复 2] 归一化 (Z-Score) ===
+                    # 与训练时保持一致！
+                    mean = signal_tensor.mean(dim=1, keepdim=True)
+                    std = signal_tensor.std(dim=1, keepdim=True) + 1e-5
+                    signal_tensor = (signal_tensor - mean) / std
+                    # 升维并移至设备 [1, 12, 5000]
+                    ecg_tensor = signal_tensor.unsqueeze(0).to(device)
                     # 如果当前在半精度运行，转换类型
-                    if self.model.ecg_projector[0].weight.dtype == torch.bfloat16:
-                        ecg_tensor = ecg_tensor.to(torch.bfloat16)
-
+                    # 自动检测模型的数据类型
+                    model_dtype = self.model.ecg_projector[0].weight.dtype
+                    ecg_tensor = ecg_tensor.to(model_dtype)
                     has_ecg = True
                 else:
                     print(f"Warning: ECG file not found: {ecg_file}")
             except ImportError:
-                print("Error: wfdb not installed.")
+                print("Error: wfdb not installed. Please `pip install wfdb`.")
             except Exception as e:
-                print(f"Error loading ECG: {e}")
+                print(f"Error loading ECG during inference: {e}")
 
         # ---------------------------------------------------------------
         # 3. 构建 Prompt 和 Tokens

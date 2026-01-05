@@ -4,3 +4,4 @@
 /checkpoint/
 /utils/grounding_train_prompt_30k.jsonl
 /test/
+/models/modeling_qwen3_ocr.py.bak
