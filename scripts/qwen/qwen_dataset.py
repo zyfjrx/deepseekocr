@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from models.deepencoder import build_sam_vit_b, build_clip_l
 # 【修改点1】移除错误的 text_encode 引用
-from models.modeling_qwen3_ocr_ori import (
+from models.modeling_qwen3_ocr import (
     BasicImageTransform,
     dynamic_preprocess,
     QwenOCRForCausalLM
