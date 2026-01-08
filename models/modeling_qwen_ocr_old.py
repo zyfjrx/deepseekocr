@@ -447,7 +447,7 @@ class QwenOCRModel(Qwen2Model):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # 2. 注入图像 Embedding (逻辑移植自 DeepseekOCRModel)
+        # 2. 注入图像 Embedding (逻辑移植自 DeepencoderEcgOCRModel)
         if images is not None and len(images) > 0 and (input_ids is None or input_ids.shape[1] != 1 or self.training) and torch.sum(images[0][1]).item() != 0:
 
             idx = 0
