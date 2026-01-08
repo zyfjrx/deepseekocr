@@ -524,8 +524,52 @@ if __name__ == '__main__':
     # 模拟模型 (如果本地没有模型，注释掉下面这行)
     model = DeepencoderEcgOCRForCausalLM.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16)
 
+    print("Freezing Vision Modules (SAM + CLIP)...")
+    # 2. 定义需要解冻（训练）的模块关键字
+    modules_to_train = [
+        "projector",  # 视觉 Projector
+        "ecg_projector",  # ECG Projector
+        "image_newline",  # 特殊 Token 参数
+        "view_seperator",
+        "ecg_start_embed",
+        "ecg_end_embed",
+        "model.layers",
+        "model.norm"
+    ]
+
+    # 3. 遍历参数，只开启命中关键字的部分
     for name, param in model.named_parameters():
-        print(name)
+        if any(keyword in name for keyword in modules_to_train):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    # 4. (重要) 再次检查验证
+    # 打印所有 requires_grad = True 的参数名，确保没有混入 embed_tokens 或 norm
+    print("=== Trainable Parameters ===")
+    for name, param in model.named_parameters():
+        if param.requires_grad == False:
+            print(f"{name}: {param.shape}")
+
+    # # 遍历所有参数
+    # for name, param in model.named_parameters():
+    #     # QwenOCRModel 定义了 self.sam_model 和 self.vision_model
+    #     if "sam_model" in name or "vision_model" in name or "ecg_encoder" in name or "model.layers" in name or "model.norm" in name or "model.embed_tokens" in name:
+    #         param.requires_grad = False
+    #     else:
+    #         # LLM (model.layers), Projector (model.projector), Embeddings 保持训练
+    #         param.requires_grad = True
+    #
+    # # 再次确认 projector 是开启梯度的
+    # # model.model.projector 是对齐层
+    # for name, param in model.model.projector.named_parameters():
+    #     param.requires_grad = True
+    # for name, param in model.model.ecg_projector.named_parameters():
+    #     param.requires_grad = True
+
+    # for name, param in model.named_parameters():
+    #     if param.requires_grad:
+    #         print(name, param.shape)
 
     # 加载 deepencode权重
     model.model.sam_model = build_sam_vit_b().to(dtype=model.dtype)

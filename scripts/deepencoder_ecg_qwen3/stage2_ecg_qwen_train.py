@@ -107,16 +107,6 @@ def main():
     )
 
     # 加载 deepencode权重
-    # model.model.sam_model = build_sam_vit_b().to(dtype=model.dtype)
-    # model.model.vision_model = build_clip_l().to(dtype=model.dtype)
-    # root_path = "/Users/zhangyf/llm/DeepEncoder/"
-    # model.model.sam_model.load_state_dict(torch.load(root_path + "sam_encoder.pth"))
-    # model.model.vision_model.load_state_dict(torch.load(root_path + "clip_encoder.pth"))
-    #
-    # embed_std = 1 / torch.sqrt(torch.tensor(model.config.hidden_size, dtype=torch.bfloat16))
-    # model.model.image_newline = torch.nn.Parameter(torch.randn(model.config.hidden_size, dtype=model.dtype) * embed_std)
-    # model.model.view_seperator = torch.nn.Parameter(torch.randn(model.config.hidden_size, dtype=model.dtype) * embed_std)
-    # 加载 deepencode权重
     model.model.sam_model = build_sam_vit_b().to(dtype=model.dtype)
     model.model.vision_model = build_clip_l().to(dtype=model.dtype)
     root_path = "/root/.cache/huggingface/hub/deepencoder/"
@@ -141,23 +131,41 @@ def main():
         model.gradient_checkpointing_enable()
 
     # 4. 冻结 Vision 模块逻辑
-    if model_args.freeze_vision:
-        print("Freezing Vision Modules (SAM + CLIP)...")
-        # 遍历所有参数
-        for name, param in model.named_parameters():
-            # QwenOCRModel 定义了 self.sam_model 和 self.vision_model
-            if "sam_model" in name or "vision_model" in name or "ecg_encoder" in name:
-                param.requires_grad = False
-            else:
-                # LLM (model.layers), Projector (model.projector), Embeddings 保持训练
-                param.requires_grad = True
+     # 开启梯度的模块
+    modules_to_train = [
+        "projector",  # 视觉 Projector
+        "ecg_projector",  # ECG Projector
+        "image_newline",  # 特殊 Token 参数
+        "view_seperator",
+        "ecg_start_embed",
+        "ecg_end_embed",
+        "model.layers",
+        "model.norm"
+    ]
 
-        # 再次确认 projector 是开启梯度的
-        # model.model.projector 是对齐层
-        for name, param in model.model.projector.named_parameters():
+    # 遍历参数，只开启命中关键字的部分
+    for name, param in model.named_parameters():
+        if any(keyword in name for keyword in modules_to_train):
             param.requires_grad = True
-        for name, param in model.model.ecg_projector.named_parameters():
-            param.requires_grad = True
+        else:
+            param.requires_grad = False
+    # if model_args.freeze_vision:
+    #     print("Freezing Vision Modules (SAM + CLIP)...")
+    #     # 遍历所有参数
+    #     for name, param in model.named_parameters():
+    #         # QwenOCRModel 定义了 self.sam_model 和 self.vision_model
+    #         if "sam_model" in name or "vision_model" in name or "ecg_encoder" in name:
+    #             param.requires_grad = False
+    #         else:
+    #             # LLM (model.layers), Projector (model.projector), Embeddings 保持训练
+    #             param.requires_grad = True
+    #
+    #     # 再次确认 projector 是开启梯度的
+    #     # model.model.projector 是对齐层
+    #     for name, param in model.model.projector.named_parameters():
+    #         param.requires_grad = True
+    #     for name, param in model.model.ecg_projector.named_parameters():
+    #         param.requires_grad = True
 
     print_trainable_parameters(model)
 
